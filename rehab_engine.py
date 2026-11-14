@@ -87,11 +87,39 @@ PLANO_ABD_MAX = 40.0            # plano de elevacion maximo: 0 = lateral puro, 9
 PLANO_ELEV_MIN = 30.0           # por debajo de esta elevacion el plano no esta definido (brazo colgando)
 PLANO_T_FUERA_S = 0.12          # permanencia minima fuera de plano para invalidar la subida (ruido)
 TORSO_GIRO_MAX_3D = 65.0        # con giro mayor (casi de perfil) el brazo lejano se ve mal: no se mide
+# De frente la abduccion ocurre en el plano de la imagen, donde el angulo 2D es casi exacto, mientras
+# que la profundidad estimada por MediaPipe suele "bajar" el brazo 3D unos grados (a 90 reales leia <80).
+# Con el torso girado como mucho esto y el brazo en plano, la elevacion es la mayor de las dos (2D y 3D).
+# Que el brazo va hacia delante lo sigue decidiendo el plano de elevacion en 3D.
+ABD_GIRO_2D_MAX = 35.0
 
 # fase 3: compensacion por inclinacion lateral del tronco
-INCLINACION_MAX = 15.0       # grados respecto a la vertical
-INCLINACION_PERSISTE_S = 0.3  # segundos seguidos para considerarlo error
-ERROR_SEPARACION_S = 1.0      # separacion minima entre errores registrados
+INCLINACION_MAX = 15.0       # inclinacion LATERAL maxima del tronco (grados, plano frontal del cuerpo)
+INCLINACION_PERSISTE_S = 0.3  # segundos seguidos (suma de dt) para considerarlo error (delta t)
+ERROR_SEPARACION_S = 1.0      # dos errores a menos de esto son el mismo episodio
+# que segundo se apunta de cada episodio: "inicio" (cuando empezo) o "confirmacion" (cuando
+# llevaba INCLINACION_PERSISTE_S, que es lo que hacia la plantilla)
+MODO_TIMESTAMP = "inicio"
+TAU_FASE3_S = 0.10            # EMA de las senales de la fase 3 (los puntos ya van con One Euro)
+FASE3_GIRO_MAX = 60.0         # mas girado (casi de perfil) la inclinacion lateral no se ve: no se mide
+# asimetria escapular (encogimiento): distancia vertical oreja-hombro de cada lado, medida a lo
+# largo del eje del tronco, comparada con su valor en reposo (brazo abajo)
+HOMBRO_RATIO_MIN = 0.72       # por debajo, ese hombro se ha subido hacia la oreja
+HOMBRO_RATIO_MIN_BRAZO_ARRIBA = 0.65  # con el brazo por encima de 90 grados el hombro sube un poco
+                                      # de forma natural (rotacion de la escapula): mas permisivo
+HOMBRO_ASIMETRIA_MIN = 0.12   # y ademas ese lado debe estar esto por debajo del otro (asimetria)
+HOMBRO_PERSISTE_S = 0.3
+HOMBRO_REF_TAU_SUBE_S = 0.5   # referencia de reposo: sube rapido...
+HOMBRO_REF_TAU_BAJA_S = 10.0  # ...y baja despacio (un encogimiento no se aprende como reposo)
+SENT_TRONCO_COMPENSACION = True  # la sentadilla con el tronco demasiado inclinado se apunta tambien
+# Reparto de responsabilidades:
+#   * la fase 3 DETECTA las compensaciones y apunta sus timestamps (no toca ningun contador);
+#   * las fases 1 y 2 miran si hubo compensacion durante SU repeticion y, si la hubo, no la cuentan.
+#     Abduccion: inclinacion lateral u hombro encogido desde que el brazo sube hasta que vuelve abajo
+#     (por eso la abduccion se cuenta al TERMINARLA, cuando el brazo vuelve abajo).
+#     Sentadilla: inclinacion lateral desde que empieza a bajar hasta que vuelve a estar de pie.
+VALIDAR_COMPENSACIONES = True
+COMPENSACION_HOMBRO_EN_SENTADILLA = False  # el hombro encogido solo invalida abducciones
 
 TAU_SUAVIZADO_S = 0.08  # constante de tiempo del filtro exponencial (fps)
 
@@ -617,7 +645,7 @@ class RehabEngine:
             self.torso_caderas = False
             self.abd_info = {lado: {"ang": None, "en_plano": False, "escorzo": None, "ref": None,
                                     "codo": None, "ang_muneca": None, "valido": True,
-                                    "plano": None, "t_fuera": 0.0}
+                                    "plano": None, "t_fuera": 0.0, "ang3d": None, "ang2d": None}
                              for lado in ("izquierdo", "derecho")}
             self.fsm_abd = {"izquierdo": FSMAbduccion(), "derecho": FSMAbduccion()}
             self.ultima_abd_t = None
@@ -644,9 +672,20 @@ class RehabEngine:
             self.pie_alto_mal = False
             self.repeticiones_sentadilla = 0
             # fase 3
-            self.inclinado_desde = None
-            self.error_activo = False
             self.timestamps_errores = []
+            self.motivos_errores = []        # motivo de cada timestamp (registro y depuracion)
+            # episodios en curso: senal -> {"t": tiempo cumpliendo, "activo": ya registrado}
+            self.episodios = {k: {"t": 0.0, "activo": False}
+                              for k in ("lateral", "hombro_I", "hombro_D", "tronco_sent")}
+            self.f3_lateral = None           # inclinacion lateral suavizada (grados)
+            self.f3_hombro = {"I": None, "D": None}       # distancia oreja-hombro / reposo
+            self.f3_hombro_ref = {"I": None, "D": None}   # distancia oreja-hombro en reposo
+            self.f3_modo = None              # "3D" o "2D": si cambia, las referencias se reinician
+            # abduccion: repeticion de cada brazo que ha llegado arriba y espera a cerrarse abajo,
+            # y compensacion vista durante la repeticion en curso de ese brazo
+            self.abd_pend = {"izquierdo": None, "derecho": None}
+            self.abd_comp = {"izquierdo": "", "derecho": ""}
+            self.sent_comp = ""              # motivo si hubo compensacion en la sentadilla en curso
 
     # ---------------------------------------------------------------- entrada
     def procesar_fotograma(self, frame_bgr, t_ms):
@@ -688,7 +727,7 @@ class RehabEngine:
                     self._anotar(t, "pose perdida")
                 self.pose_detectada = False
                 self.visibles = 0
-                self.inclinado_desde = None
+                self._fase3_cortar()
                 for fsm in self.fsm_abd.values():
                     fsm.sin_medida(dt)
                 self.fsm_sent.sin_medida(dt)
@@ -718,13 +757,15 @@ class RehabEngine:
             W = None
             if mundo is not None:
                 W = self.filtro_mundo(np.array([[p.x, p.y, p.z] for p in mundo]), dt_f)
-                self.modo_3d = True
+            self.modo_3d = W is not None
+            # fase 3 primero: detecta compensaciones y apunta timestamps; las fases 1 y 2 las consultan
+            self._fase_3(P, vis, dt_f, t, W)
+            if W is not None:
                 self._fase_1_3d(W, img, vis, dt_f, t)
             else:
-                self.modo_3d = False
                 self._fase_1(P, img, vis, dt_f, t)
+            self._abd_revisar(t)
             self._fase_2(P, vis, dt_f, t, W)
-            self._fase_3(P, vis, t)
 
     def _anotar(self, t, texto):
         self.log.append(f"{t:6.1f}s  {texto}")
@@ -908,12 +949,26 @@ class RehabEngine:
             en_plano = en_plano_ahora or info["t_fuera"] < PLANO_T_FUERA_S
             info["ang"], info["en_plano"], info["plano"], info["escorzo"] = ang, en_plano, plano, None
 
+            # de frente: la elevacion 2D (exacta en el plano de la imagen) corrige al 3D si este se queda corto
+            P2 = img * np.array([self.aspecto, 1.0])
+            usar_2d = giro <= ABD_GIRO_2D_MAX and en_plano_ahora
+            abajo_2d = (P2[CADERA_I] + P2[CADERA_D]) / 2 - (P2[HOMBRO_I] + P2[HOMBRO_D]) / 2
+            ang_2d = angulo_vectores(abajo_2d, P2[codo] - P2[hombro]) if usar_2d else None
+            info["ang3d"], info["ang2d"] = ang, ang_2d
+            if ang_2d is not None and ang_2d > ang:
+                ang = ang_2d
+                info["ang"] = ang
+
             # muneca: brazo entero por encima del umbral y codo estirado (en 3D)
             info["codo"], info["ang_muneca"], valido = None, None, True
             if self._visibles(vis, (muneca,)):
                 antebrazo = W[muneca] - W[codo]
                 codo_ang = angulo_vectores(-brazo, antebrazo)
                 ang_muneca = angulo_vectores(-v, W[muneca] - W[hombro])
+                if usar_2d:
+                    m2 = angulo_vectores(abajo_2d, P2[muneca] - P2[hombro])
+                    if m2 is not None and ang_muneca is not None:
+                        ang_muneca = max(ang_muneca, m2)
                 info["codo"], info["ang_muneca"] = codo_ang, ang_muneca
                 if codo_ang is None or ang_muneca is None:
                     valido = False
@@ -939,14 +994,46 @@ class RehabEngine:
         self.rom_max = ang if self.rom_max is None else max(self.rom_max, ang)
 
     def _cerrar_abduccion(self, lado, t):
+        """El brazo ha llegado a 90 grados: la repeticion queda pendiente hasta que vuelva abajo."""
+        self.abd_pend[lado] = {"t": t, "pico": self.fsm_abd[lado].pico}
+
+    def _abd_revisar(self, t):
+        """Cierra las abducciones: cuentan al volver el brazo abajo si no hubo compensacion."""
+        for lado in ("izquierdo", "derecho"):
+            fsm, info = self.fsm_abd[lado], self.abd_info[lado]
+            en_rep = fsm.estado == FSMAbduccion.ARRIBA or (info["ang"] is not None and info["ang"] > ABD_ABAJO)
+            if en_rep and VALIDAR_COMPENSACIONES and not self.abd_comp[lado]:
+                self.abd_comp[lado] = self._compensacion_activa(hombro=True)
+            pend = self.abd_pend[lado]
+            if pend is not None and fsm.estado == FSMAbduccion.ABAJO:        # rearmado: repeticion completa
+                self._contar_abduccion(lado, pend, t)
+                self.abd_pend[lado], self.abd_comp[lado] = None, ""
+            elif pend is not None and fsm.estado == FSMAbduccion.SIN_ARMAR:  # brazo perdido mucho rato
+                self._anotar(t, f"abduccion descartada: brazo {lado} perdido")
+                self.abd_pend[lado], self.abd_comp[lado] = None, ""
+            elif pend is None and not en_rep:
+                self.abd_comp[lado] = ""
+
+    def _contar_abduccion(self, lado, pend, t):
         # si los dos brazos terminan casi a la vez es una abduccion bilateral: cuenta una vez
         if self.ultima_abd_t is not None and t - self.ultima_abd_t < ABD_FUSION_BILATERAL_S:
             return
         self.ultima_abd_t = t
-        self.repeticiones_abduccion += 1
-        pico = self.fsm_abd[lado].pico
-        self._anotar(t, f"abduccion {self.repeticiones_abduccion} ({lado[0].upper()}, {pico:.0f}°)")
         self.fsm_abd[lado].pico = 0.0
+        if self.abd_comp[lado]:
+            self._anotar(t, f"abduccion no valida: compensacion ({self.abd_comp[lado]})")
+            return
+        self.repeticiones_abduccion += 1
+        self._anotar(t, f"abduccion {self.repeticiones_abduccion} ({lado[0].upper()}, {pend['pico']:.0f}°)")
+
+    def _abd_pendientes_validas(self):
+        """Abducciones que llegaron arriba sin compensacion y aun no han bajado (fin del video)."""
+        ts = sorted(p["t"] for l, p in self.abd_pend.items() if p is not None and not self.abd_comp[l])
+        if not ts:
+            return 0
+        if self.ultima_abd_t is not None and abs(ts[0] - self.ultima_abd_t) < ABD_FUSION_BILATERAL_S:
+            ts = ts[1:]
+        return 0 if not ts else (1 if len(ts) == 1 or ts[-1] - ts[0] < ABD_FUSION_BILATERAL_S else 2)
 
     @staticmethod
     def _separacion_pies(P, vis, W):
@@ -1065,10 +1152,13 @@ class RehabEngine:
             self.zancada_t, self.zancada_max, self.zancada_mal = 0.0, 0.0, False
             self.tronco_t, self.tronco_max, self.tronco_mal = 0.0, 0.0, False
             self.pie_alto_t, self.pie_alto_max, self.pie_alto_mal = 0.0, 0.0, False
+            self.sent_comp = ""
 
         en_rep = fsm.estado in (FSMSentadilla.BAJANDO, FSMSentadilla.ABAJO, FSMSentadilla.SUBIENDO)
         if not en_rep and not completada and ang is not None and ang > fsm.arriba:
             self._tronco_frente(P, vis, W, dt, de_pie=True)   # de pie: aprende la referencia
+        if (en_rep or completada) and VALIDAR_COMPENSACIONES and not self.sent_comp:
+            self.sent_comp = self._compensacion_activa(hombro=COMPENSACION_HOMBRO_EN_SENTADILLA)
         if en_rep or completada:
             self.zancada = self._separacion_pies(P, vis, W)
             if self.zancada is not None:
@@ -1104,44 +1194,150 @@ class RehabEngine:
                 self._anotar(t, f"sentadilla no valida: zancada, un pie delante del otro ({self.zancada_max:.2f})")
             elif self.tronco_mal:
                 self._anotar(t, f"sentadilla no valida: tronco demasiado inclinado ({self.tronco_max:.0f}°)")
+            elif VALIDAR_COMPENSACIONES and self.sent_comp:
+                self._anotar(t, f"sentadilla no valida: compensacion ({self.sent_comp})")
             else:
                 self.repeticiones_sentadilla += 1
                 self._anotar(t, f"sentadilla {self.repeticiones_sentadilla} ({fsm.ultimo_minimo:.0f}°)")
             self.zancada_t, self.zancada_max, self.zancada_mal = 0.0, 0.0, False
             self.tronco_t, self.tronco_max, self.tronco_mal = 0.0, 0.0, False
             self.pie_alto_t, self.pie_alto_max, self.pie_alto_mal = 0.0, 0.0, False
+            self.sent_comp = ""
         if fsm.evento:
             self._anotar(t, fsm.evento)
         self.sent_estado_prev = fsm.estado
         self.sent = fsm.angulo
 
-    def _fase_3(self, img, vis, t):
-        # compensacion: tronco inclinado lateralmente de forma sostenida
-        if not self._visibles(vis, (HOMBRO_I, HOMBRO_D, CADERA_I, CADERA_D)):
-            self.inclinado_desde = None
+    # ---------------------------------------------------------------- fase 3
+    def _registrar_compensacion(self, t_inicio, t_confirmacion, motivo):
+        """Apunta un error (un timestamp por episodio). Dos a menos de ERROR_SEPARACION_S se juntan."""
+        ts = t_inicio if MODO_TIMESTAMP == "inicio" else t_confirmacion
+        ts = round(max(0.0, ts), 2)
+        if any(abs(ts - otro) < ERROR_SEPARACION_S for otro in self.timestamps_errores):
             return
-        hx, hy = (img[HOMBRO_I] + img[HOMBRO_D]) / 2
-        cx, cy = (img[CADERA_I] + img[CADERA_D]) / 2
-        inclinacion = abs(math.degrees(math.atan2(hx - cx, cy - hy)))
+        self.timestamps_errores.append(ts)
+        self.motivos_errores.append(motivo)
+        orden = sorted(range(len(self.timestamps_errores)), key=lambda i: self.timestamps_errores[i])
+        self.timestamps_errores = [self.timestamps_errores[i] for i in orden]
+        self.motivos_errores = [self.motivos_errores[i] for i in orden]
+        self._anotar(t_confirmacion, f"compensacion: {motivo} (t={ts:.2f}s)")
 
-        if inclinacion <= INCLINACION_MAX:
-            self.inclinado_desde = None
-            self.error_activo = False
+    def _episodio(self, clave, cumple, dt, t, motivo, persiste):
+        """Condicion mantenida durante `persiste` segundos (suma de dt) = un episodio, apuntado una vez."""
+        ep = self.episodios[clave]
+        if not cumple:
+            ep["t"], ep["activo"] = 0.0, False
             return
-        if self.inclinado_desde is None:
-            self.inclinado_desde = t
-        if not self.error_activo and t - self.inclinado_desde >= INCLINACION_PERSISTE_S:
-            self.error_activo = True
-            if not self.timestamps_errores or t - self.timestamps_errores[-1] >= ERROR_SEPARACION_S:
-                self.timestamps_errores.append(round(t, 2))
-                self._anotar(t, "compensacion tronco")
+        ep["t"] += dt
+        if not ep["activo"] and ep["t"] >= persiste:
+            ep["activo"] = True
+            self._registrar_compensacion(t - ep["t"], t, motivo)
+
+    def _fase3_cortar(self):
+        """Sin pose fiable: los episodios en curso se cortan (no se arrastran por encima del hueco)."""
+        for ep in self.episodios.values():
+            ep["t"], ep["activo"] = 0.0, False
+
+    def _fase_3(self, P, vis, dt, t, W=None):
+        """Compensaciones: inclinacion lateral del tronco y asimetria escapular (encogimiento).
+
+        Siempre activa mientras la pose sea fiable. Las senales se suavizan con una EMA con dt real
+        (encima del One Euro de los puntos) y solo cuentan si se mantienen INCLINACION_PERSISTE_S /
+        HOMBRO_PERSISTE_S seguidos. Ademas, la fase 2 apunta aqui la sentadilla con el tronco
+        demasiado inclinado hacia delante.
+        """
+        if not self._visibles(vis, (HOMBRO_I, HOMBRO_D)) or \
+                vis[CADERA_I] < VIS_CADERA_MIN or vis[CADERA_D] < VIS_CADERA_MIN:
+            self._fase3_cortar()
+            return
+        modo = "3D" if W is not None else "2D"
+        if modo != self.f3_modo:
+            self.f3_modo = modo
+            self.f3_hombro_ref = {"I": None, "D": None}
+            self.f3_lateral = None
+        Q = W if W is not None else P
+        arriba = np.array([0.0, -1.0, 0.0]) if W is not None else np.array([0.0, -1.0])
+        centro_h = (Q[HOMBRO_I] + Q[HOMBRO_D]) / 2
+        tronco = centro_h - (Q[CADERA_I] + Q[CADERA_D]) / 2
+        alto = float(np.linalg.norm(tronco))
+        if alto < 1e-6:
+            self._fase3_cortar()
+            return
+        eje = tronco / alto
+
+        # ---- 1) inclinacion lateral del tronco, en el plano frontal DEL CUERPO
+        lat = (Q[CADERA_I] - Q[CADERA_D]) + (Q[HOMBRO_I] - Q[HOMBRO_D])
+        lat = lat - np.dot(lat, arriba) * arriba          # horizontal
+        nl = float(np.linalg.norm(lat))
+        lateral = None
+        if nl > 1e-6:
+            lat = lat / nl
+            if W is not None:
+                giro = math.degrees(math.atan2(abs(float(lat[2])), abs(float(lat[0])) + 1e-9))
+            else:
+                ancho = (np.linalg.norm(P[CADERA_I] - P[CADERA_D]) + np.linalg.norm(P[HOMBRO_I] - P[HOMBRO_D])) / 2
+                giro = 90.0 if ancho / alto <= SENT_PERFIL_ANCHO_MAX else 0.0
+            if giro <= FASE3_GIRO_MAX:
+                lateral = math.degrees(math.atan2(abs(float(np.dot(tronco, lat))), float(np.dot(tronco, arriba))))
+        if lateral is None:
+            self.f3_lateral = None
+            self.episodios["lateral"]["t"], self.episodios["lateral"]["activo"] = 0.0, False
+        else:
+            self.f3_lateral = _ema(self.f3_lateral, lateral, dt, TAU_FASE3_S)
+            self._episodio("lateral", self.f3_lateral > INCLINACION_MAX, dt, t,
+                           f"inclinacion lateral del tronco ({self.f3_lateral:.0f}°)", INCLINACION_PERSISTE_S)
+
+        # ---- 2) asimetria escapular: el hombro sube hacia la oreja
+        en_sentadilla = self.fsm_sent.estado in (FSMSentadilla.BAJANDO, FSMSentadilla.ABAJO, FSMSentadilla.SUBIENDO)
+        ratios = {}
+        for lado, oreja, hombro, nombre in (("I", OREJA_I, HOMBRO_I, "izquierdo"), ("D", OREJA_D, HOMBRO_D, "derecho")):
+            if vis[oreja] < VISIBILIDAD_MIN:
+                self.f3_hombro[lado] = None
+                continue
+            d = float(np.dot(Q[oreja] - Q[hombro], eje))     # altura de la oreja sobre el hombro
+            if d <= 1e-6:
+                self.f3_hombro[lado] = None
+                continue
+            brazo = self.abd_info[nombre]["ang"]
+            brazo_abajo = brazo is None or brazo < ABD_ABAJO
+            ref = self.f3_hombro_ref[lado]
+            if brazo_abajo and not en_sentadilla:
+                tau = HOMBRO_REF_TAU_SUBE_S if (ref is None or d > ref) else HOMBRO_REF_TAU_BAJA_S
+                self.f3_hombro_ref[lado] = ref = _ema(ref, d, dt, tau)
+            if ref is None:
+                self.f3_hombro[lado] = None
+                continue
+            self.f3_hombro[lado] = _ema(self.f3_hombro[lado], d / ref, dt, TAU_FASE3_S)
+            ratios[lado] = (self.f3_hombro[lado], brazo)
+        for lado, otro, nombre in (("I", "D", "izquierdo"), ("D", "I", "derecho")):
+            clave = "hombro_" + lado
+            if lado not in ratios or otro not in ratios:
+                self.episodios[clave]["t"], self.episodios[clave]["activo"] = 0.0, False
+                continue
+            r, brazo = ratios[lado]
+            limite = HOMBRO_RATIO_MIN_BRAZO_ARRIBA if (brazo is not None and brazo > 90.0) else HOMBRO_RATIO_MIN
+            cumple = r < limite and r < ratios[otro][0] - HOMBRO_ASIMETRIA_MIN
+            self._episodio(clave, cumple, dt, t, f"hombro {nombre} encogido ({r:.2f})", HOMBRO_PERSISTE_S)
+
+        # ---- 3) tronco demasiado inclinado hacia delante en la sentadilla (lo mide la fase 2)
+        en_sent = self.fsm_sent.estado in (FSMSentadilla.BAJANDO, FSMSentadilla.ABAJO, FSMSentadilla.SUBIENDO)
+        lim = SENT_TRONCO_MAX if self.tronco_modo == "perfil" else SENT_TRONCO_FRENTE_MAX
+        self._episodio("tronco_sent", SENT_TRONCO_COMPENSACION and en_sent and self.tronco is not None
+                       and self.tronco > lim, dt, t, "tronco inclinado en sentadilla", SENT_TRONCO_T_S)
+
+    def _compensacion_activa(self, hombro=True):
+        """Motivo de la compensacion activa ahora (inclinacion lateral y, si se pide, hombro), o ""."""
+        nombres = {"lateral": "inclinacion lateral del tronco",
+                   "hombro_I": "hombro izquierdo encogido", "hombro_D": "hombro derecho encogido"}
+        claves = ("lateral", "hombro_I", "hombro_D") if hombro else ("lateral",)
+        return ", ".join(nombres[k] for k in claves if self.episodios[k]["activo"])
 
     # ---------------------------------------------------------------- salida
     def resultados(self):
         """Diccionario con el esquema exacto exigido por el evaluador."""
         with self.lock:
             return {
-                "fase_1": {"repeticiones_abduccion": int(self.repeticiones_abduccion)},
+                "fase_1": {"repeticiones_abduccion": int(self.repeticiones_abduccion + self._abd_pendientes_validas())},
                 "fase_2": {"repeticiones_sentadilla": int(self.repeticiones_sentadilla)},
                 "fase_3": {
                     "compensaciones_detectadas": bool(self.timestamps_errores),
@@ -1169,9 +1365,17 @@ class RehabEngine:
                     plano += f" ({info['plano']:.0f})"
                 codo = "codo ?" if info["codo"] is None else (
                     f"codo {info['codo']:.0f}" + ("" if info["codo"] >= CODO_EXTENDIDO_MIN else " DOBLADO"))
-                lineas.append((f"{letra}: {info['ang']:3.0f}deg  {plano}  {codo}  {fsm.estado}",
+                fuente = ""
+                if info.get("ang2d") is not None and info.get("ang3d") is not None:
+                    fuente = f" (3D {info['ang3d']:.0f}/2D {info['ang2d']:.0f})"
+                lineas.append((f"{letra}: {info['ang']:3.0f}deg{fuente}  {plano}  {codo}  {fsm.estado}",
                                info["en_plano"] and info["valido"]))
             lineas.append((f"abducciones: {self.repeticiones_abduccion}", True))
+            lat = "lateral ?" if self.f3_lateral is None else f"lateral {self.f3_lateral:.0f}deg"
+            hi = "?" if self.f3_hombro["I"] is None else f"{self.f3_hombro['I']:.2f}"
+            hd = "?" if self.f3_hombro["D"] is None else f"{self.f3_hombro['D']:.2f}"
+            mal = any(ep["activo"] for ep in self.episodios.values())
+            lineas.append((f"fase 3: {lat}  hombros I {hi} D {hd}  errores {len(self.timestamps_errores)}", not mal))
             f2 = self.fsm_sent
             rodilla = "rodilla ?" if f2.angulo is None else \
                 f"rodilla{' 3D' if self.est_rodilla.usa_3d else ''} {f2.angulo:.0f}deg"
@@ -1245,7 +1449,7 @@ def _depurar_video(ruta):
     w.writerow(["t", "visibles", "torso_giro", "caderas",
                 "I_ang", "I_muneca", "I_codo", "I_escorzo", "I_plano", "I_en_plano", "I_estado",
                 "D_ang", "D_muneca", "D_codo", "D_escorzo", "D_plano", "D_en_plano", "D_estado",
-                "abducciones", "sentadillas", "rodilla", "sent_estado", "sent_pausa", "zancada", "tronco_perfil", "pie_levantado", "errores_tronco"])
+                "abducciones", "sentadillas", "rodilla", "sent_estado", "sent_pausa", "zancada", "tronco_perfil", "pie_levantado", "f3_lateral", "f3_hombro_I", "f3_hombro_D", "errores_fase3"])
 
     motor = RehabEngine()
     puntos, conexiones = obtener_estilos_dibujo()
@@ -1284,6 +1488,7 @@ def _depurar_video(ruta):
                      motor.fsm_abd[lado].estado]
         fila += [motor.repeticiones_abduccion, motor.repeticiones_sentadilla, r(motor.sent),
                  motor.fsm_sent.estado, round(motor.fsm_sent.pausa, 2), r(motor.zancada), r(motor.tronco), r(motor.pie_alto),
+                 r(motor.f3_lateral), r(motor.f3_hombro["I"]), r(motor.f3_hombro["D"]),
                  len(motor.timestamps_errores)]
         w.writerow(fila)
 
