@@ -232,7 +232,8 @@ class FSMAbduccion:
 
 
 # ==================================================================== fase 2: sentadilla
-# Integrado tal cual desde fase2_sentadilla.py. Descripcion original:
+# Integrado desde fase2_sentadilla.py con tres cambios v2 (ver constantes USAR_RODILLA_3D,
+# MODO_T_MIN y SENT_MIN_VALIDO). Descripcion original:
 # Fase 2: conteo de sentadillas con una maquina de estados (FSM) e histeresis temporal.
 #
 # Sin dependencias de Streamlit ni de MediaPipe (solo math y numpy), para poder probarla
@@ -296,6 +297,17 @@ T_MIN_ARRIBA_S = 0.10   # sostenido de pie para cerrar la repeticion
 T_MAX_ABAJO_S = 6.0     # mas tiempo abajo no es una sentadilla, es estar sentado
 T_HUECO_S = 1.0         # sin ver las piernas este tiempo, la repeticion en curso se pierde
 
+# ---- cambios v2 (sobre la version original de la fase 2) ----
+# 1) Angulo de rodilla en 3D con pose_world_landmarks (igual de frente que de perfil).
+#    El 2D y el escorzo quedan de respaldo si no hay puntos 3D.
+USAR_RODILLA_3D = True
+# 2) t_min en flexion: "acumulado" = basta con sumar T_MIN_ABAJO_S por debajo de SENT_ABAJO
+#    (sentadillas fluidas, sin parar abajo); "pausa" = criterio original (quieta T_PAUSA_S).
+MODO_T_MIN = "acumulado"
+T_MIN_ABAJO_S = 0.25    # tiempo minimo acumulado (suma de dt) por debajo de SENT_ABAJO
+# 3) Profundidad maxima: por debajo de este angulo de rodilla es una cuclilla, no cuenta.
+SENT_MIN_VALIDO = 60.0
+
 TAU_ANGULO_S = 0.06     # EMA ligera del angulo (los puntos ya vienen filtrados con One Euro)
 
 
@@ -339,13 +351,18 @@ class EstimadorRodilla:
     def reiniciar(self):
         self.ratio = {"I": None, "D": None}   # altura muslo / tibia, suavizado
         self.ref = {"I": None, "D": None}     # su valor de pie (referencia)
-        self.detalle = {}                     # por pierna: (ang_2d, ang_frontal), para depurar
+        self.detalle = {}                     # por pierna: (ang_2d, ang_frontal[, ang_3d]), para depurar
+        self.usa_3d = False
 
-    def medir(self, P, vis, dt):
+    def medir(self, P, vis, dt, W=None):
         """Devuelve el angulo de rodilla combinado, o None si no se ve ninguna pierna.
 
         P: array (33, 2) en el plano XY con aspecto corregido (y hacia abajo). vis: (33,).
+        W: array (33, 3) de pose_world_landmarks (metros), opcional. Si esta y USAR_RODILLA_3D,
+           el angulo de cada pierna es el 3D cadera-rodilla-tobillo (el 2D y el escorzo se
+           siguen calculando para depurar y para mantener caliente la referencia de pie).
         """
+        self.usa_3d = False
         piernas = []
         self.detalle = {}
         for lado, cadera, rodilla, tobillo in PIERNAS:
@@ -370,7 +387,14 @@ class EstimadorRodilla:
                 ang_2d = ang_frontal
             self.detalle[lado] = (ang_2d, ang_frontal)
             confianza = float(min(vis[cadera], vis[rodilla], vis[tobillo]))
-            piernas.append((min(ang_2d, ang_frontal), confianza))
+            ang_pierna = min(ang_2d, ang_frontal)
+            if W is not None and USAR_RODILLA_3D:
+                ang_3d = _angulo(W[cadera], W[rodilla], W[tobillo])
+                if ang_3d is not None:
+                    ang_pierna = ang_3d
+                    self.usa_3d = True
+                    self.detalle[lado] = (ang_2d, ang_frontal, ang_3d)
+            piernas.append((ang_pierna, confianza))
 
         if not piernas:
             return None
@@ -399,6 +423,7 @@ class FSMSentadilla:
         self.ultimo_minimo = None
         self.ventana = deque()  # (t, angulo) de los ultimos T_PAUSA_S, para detectar la pausa
         self.pausa = 0.0        # cuanto lleva quieto abajo (para depurar)
+        self.t_bajo = 0.0       # tiempo acumulado por debajo de SENT_ABAJO en la bajada (modo acumulado)
         self.evento = None      # texto del ultimo evento, para el registro del motor
 
     def _cambiar(self, estado):
@@ -446,19 +471,27 @@ class FSMSentadilla:
             self.t_cond = self.t_cond + dt if a < SENT_INICIO else 0.0
             if self.t_cond >= T_MIN_INICIO_S:
                 self._cambiar(self.BAJANDO)
-                self.minimo, self.t_abajo, self.pausa = a, 0.0, 0.0
+                self.minimo, self.t_abajo, self.pausa, self.t_bajo = a, 0.0, 0.0, 0.0
                 self.ventana.clear()
             return False
 
         self.minimo = a if self.minimo is None else min(self.minimo, a)
 
         if self.estado == self.BAJANDO:
-            if self._en_pausa(a):
+            if MODO_T_MIN == "acumulado":
+                if a < SENT_ABAJO:
+                    self.t_bajo += dt
+                self.pausa = self.t_bajo        # se muestra como "pausa" en la depuracion
+                listo = self.t_bajo >= T_MIN_ABAJO_S
+            else:
+                listo = self._en_pausa(a)
+            if listo:
                 self.t_abajo = self.pausa
                 self._cambiar(self.ABAJO)
             elif a > SENT_ARRIBA:
                 # se ha vuelto a estirar sin pausa abajo: no cuenta
-                motivo = "sin pausa abajo" if self.minimo < SENT_ABAJO else "poco profunda"
+                motivo = ("sin pausa abajo" if MODO_T_MIN == "pausa" else "muy breve abajo") \
+                    if self.minimo < SENT_ABAJO else "poco profunda"
                 self.evento = f"sentadilla no valida: {motivo} ({self.minimo:.0f}°)"
                 self._cambiar(self.DE_PIE)
             return False
@@ -484,6 +517,9 @@ class FSMSentadilla:
             self.ultimo_minimo = self.minimo
             self.minimo = None
             self._cambiar(self.DE_PIE)
+            if self.ultimo_minimo is not None and self.ultimo_minimo < SENT_MIN_VALIDO:
+                self.evento = f"sentadilla no valida: demasiado profunda, cuclillas ({self.ultimo_minimo:.0f}°)"
+                return False
             return True
         return False
 
@@ -609,6 +645,7 @@ class RehabEngine:
             # (x e y normalizados no miden lo mismo si el video no es cuadrado)
             P = img * np.array([self.aspecto, 1.0])
 
+            W = None
             if mundo is not None:
                 W = self.filtro_mundo(np.array([[p.x, p.y, p.z] for p in mundo]), dt_f)
                 self.modo_3d = True
@@ -616,7 +653,7 @@ class RehabEngine:
             else:
                 self.modo_3d = False
                 self._fase_1(P, img, vis, dt_f, t)
-            self._fase_2(P, vis, dt_f, t)
+            self._fase_2(P, vis, dt_f, t, W)
             self._fase_3(P, vis, t)
 
     def _anotar(self, t, texto):
@@ -841,9 +878,9 @@ class RehabEngine:
         self._anotar(t, f"abduccion {self.repeticiones_abduccion} ({lado[0].upper()}, {pico:.0f}°)")
         self.fsm_abd[lado].pico = 0.0
 
-    def _fase_2(self, P, vis, dt, t):
+    def _fase_2(self, P, vis, dt, t, W=None):
         """Sentadilla: angulo de rodilla (2D + escorzo) y FSM con pausa minima abajo."""
-        ang = self.est_rodilla.medir(P, vis, dt)
+        ang = self.est_rodilla.medir(P, vis, dt, W)
         if ang is None:
             self.fsm_sent.sin_medida(dt)
         elif self.fsm_sent.actualizar(ang, dt):
@@ -911,8 +948,9 @@ class RehabEngine:
                                info["en_plano"] and info["valido"]))
             lineas.append((f"abducciones: {self.repeticiones_abduccion}", True))
             f2 = self.fsm_sent
-            rodilla = "rodilla ?" if f2.angulo is None else f"rodilla {f2.angulo:.0f}deg"
-            lineas.append((f"sentadilla: {f2.estado}  {rodilla}  pausa {f2.pausa:.1f}s  "
+            rodilla = "rodilla ?" if f2.angulo is None else \
+                f"rodilla{' 3D' if self.est_rodilla.usa_3d else ''} {f2.angulo:.0f}deg"
+            lineas.append((f"sentadilla: {f2.estado}  {rodilla}  {'abajo' if MODO_T_MIN == 'acumulado' else 'pausa'} {f2.pausa:.1f}s  "
                            f"reps {self.repeticiones_sentadilla}", f2.angulo is not None))
             return lineas
 
