@@ -232,8 +232,8 @@ class FSMAbduccion:
 
 
 # ==================================================================== fase 2: sentadilla
-# Integrado desde fase2_sentadilla.py con tres cambios v2 (ver constantes USAR_RODILLA_3D,
-# MODO_T_MIN y SENT_MIN_VALIDO). Descripcion original:
+# Integrado desde fase2_sentadilla.py con cambios (ver constantes USAR_RODILLA_3D, MODO_T_MIN,
+# SENT_MIN_VALIDO, SENT_AMBAS_PIERNAS, SENT_PIE_MARGEN, SENT_ZANCADA_MAX, SENT_TRONCO_MAX y SENT_PIE_LEVANTADO_MAX). Descripcion original:
 # Fase 2: conteo de sentadillas con una maquina de estados (FSM) e histeresis temporal.
 #
 # Sin dependencias de Streamlit ni de MediaPipe (solo math y numpy), para poder probarla
@@ -307,6 +307,49 @@ MODO_T_MIN = "acumulado"
 T_MIN_ABAJO_S = 0.25    # tiempo minimo acumulado (suma de dt) por debajo de SENT_ABAJO
 # 3) Profundidad maxima: por debajo de este angulo de rodilla es una cuclilla, no cuenta.
 SENT_MIN_VALIDO = 60.0
+# 4) Las dos piernas deben doblarse: si las dos se ven bien, manda la MENOS flexionada
+#    (asi apoyar el peso en una pierna o doblar solo una no cuenta como sentadilla).
+SENT_AMBAS_PIERNAS = True
+VIS_AMBAS_MIN = 0.65        # confianza minima de rodilla y tobillo de cada pierna para exigir las
+                            # dos (la cadera no cuenta: de frente MediaPipe le da poca confianza).
+                            # De perfil la pierna del fondo se ve peor: entonces manda la fiable.
+# 5) "De pie" relativo a cada persona: el angulo de rodilla de pie no siempre se lee como
+#    160-180 (de frente, MediaPipe suele dar 150-165 con la pierna recta). Se aprende el angulo
+#    de pie de la persona (sube rapido, baja muy despacio) y los umbrales de pie se fijan respecto
+#    a el, nunca por debajo de un minimo.
+SENT_PIE_MARGEN = 12.0      # cierra la repeticion al volver a menos de esto del angulo de pie
+SENT_ARRIBA_MIN = 145.0     # umbral de pie minimo (nunca se cierra una repeticion por debajo)
+SENT_INICIO_MARGEN = 8.0    # empieza a bajar cuando cae esto por debajo del umbral de pie
+SENT_PIE_TAU_SUBE_S = 0.3
+SENT_PIE_TAU_BAJA_S = 30.0
+# 6) Zancada: en una sentadilla los pies estan a la par; en una zancada uno va delante y otro
+#    detras. Se mide la separacion delante-detras de los tobillos (eje antero-posterior del
+#    cuerpo, en 3D) dividida por la longitud de la pierna. Si se mantiene por encima del
+#    umbral durante la repeticion, no cuenta.
+SENT_ZANCADA_MAX = 0.35     # pies separados delante-detras mas de ~1/3 de pierna = zancada
+SENT_ZANCADA_T_S = 0.20     # mantenido este tiempo (suma de dt)
+# 7) Tronco demasiado inclinado ("casi a gatas con las rodillas dobladas"): solo se comprueba
+#    cuando la persona esta DE PERFIL (o casi), porque entonces la inclinacion se ve en el plano de
+#    la imagen y se mide sin depender de la profundidad estimada. De frente el tronco se inclina
+#    hacia la camara y MediaPipe no lo mide bien (daba falsos positivos), asi que no se comprueba.
+#    Referencia: en una sentadilla correcta el tronco va ~paralelo a la tibia (30-45 grados).
+SENT_TRONCO_MAX = 55.0      # inclinacion maxima del tronco respecto a la vertical (grados)
+SENT_TRONCO_T_S = 0.20      # mantenida este tiempo (suma de dt)
+SENT_PERFIL_GIRO_MIN = 50.0 # giro del cuerpo respecto a la camara para considerarlo de perfil
+SENT_PERFIL_ANCHO_MAX = 0.35  # sin 3D: anchura aparente de caderas+hombros / altura del tronco
+# 8) Tronco inclinado DE FRENTE: hacia la camara no se ve el angulo, pero el tronco se ve mas corto
+#    (escorzo): altura vertical aparente del tronco / anchura de hombros = cos(inclinacion) x su valor de pie.
+#    El valor de pie se aprende mientras la persona esta de pie. Para evitar falsos positivos solo
+#    invalida si ademas la inclinacion 3D (pose_world_landmarks) lo confirma.
+SENT_TRONCO_FRENTE = True
+SENT_TRONCO_FRENTE_MAX = 60.0   # de frente un poco mas permisivo (la perspectiva exagera el escorzo)
+SENT_TRONCO_3D_CONFIRMA = 40.0  # la inclinacion 3D debe pasar al menos de esto para confirmarlo
+SENT_TRONCO_REF_TAU_S = 1.0     # aprendizaje del valor de pie (solo mientras esta de pie)
+# 9) Pierna levantada: en una sentadilla los DOS pies estan en el suelo. Si un tobillo queda muy por
+#    encima del otro (diferencia de altura / longitud de pierna), es levantar la pierna, una marcha
+#    o un paso, no una sentadilla. Se mide en vertical, asi que vale de frente, de perfil y girado.
+SENT_PIE_LEVANTADO_MAX = 0.20   # ~1/5 de pierna (unos 15-20 cm); talones algo levantados no llegan
+SENT_PIE_LEVANTADO_T_S = 0.15   # mantenido este tiempo (suma de dt)
 
 TAU_ANGULO_S = 0.06     # EMA ligera del angulo (los puntos ya vienen filtrados con One Euro)
 
@@ -394,15 +437,17 @@ class EstimadorRodilla:
                     ang_pierna = ang_3d
                     self.usa_3d = True
                     self.detalle[lado] = (ang_2d, ang_frontal, ang_3d)
-            piernas.append((ang_pierna, confianza))
+            piernas.append((ang_pierna, confianza, float(min(vis[rodilla], vis[tobillo]))))
 
         if not piernas:
             return None
+        if SENT_AMBAS_PIERNAS and len(piernas) == 2 and min(p[2] for p in piernas) >= VIS_AMBAS_MIN:
+            return max(p[0] for p in piernas)   # la menos flexionada: tienen que doblarse las dos
         if len(piernas) == 2 and abs(piernas[0][0] - piernas[1][0]) > DESACUERDO_PIERNAS_MAX:
             # una de las dos esta mal estimada (oclusion de perfil): la de mas confianza
             return max(piernas, key=lambda p: p[1])[0]
-        peso = sum(c for _, c in piernas)
-        return sum(a * c for a, c in piernas) / peso
+        peso = sum(p[1] for p in piernas)
+        return sum(p[0] * p[1] for p in piernas) / peso
 
 
 # ==================================================================== maquina de estados
@@ -425,6 +470,9 @@ class FSMSentadilla:
         self.pausa = 0.0        # cuanto lleva quieto abajo (para depurar)
         self.t_bajo = 0.0       # tiempo acumulado por debajo de SENT_ABAJO en la bajada (modo acumulado)
         self.evento = None      # texto del ultimo evento, para el registro del motor
+        self.ref_pie = None     # angulo de rodilla de pie de esta persona (aprendido)
+        self.arriba = SENT_ARRIBA
+        self.inicio = SENT_INICIO
 
     def _cambiar(self, estado):
         self.estado, self.t_cond = estado, 0.0
@@ -438,6 +486,7 @@ class FSMSentadilla:
             self.evento = "sentadilla: piernas perdidas, hay que volver a ponerse de pie"
             self._cambiar(self.SIN_ARMAR)
             self.angulo = None
+            self.ref_pie = None
 
     def _en_pausa(self, a):
         """True si en los ultimos T_PAUSA_S el angulo ha estado abajo y casi quieto."""
@@ -460,15 +509,20 @@ class FSMSentadilla:
         self.t_sin_ver = 0.0
         self.angulo = _ema(self.angulo, angulo, dt, TAU_ANGULO_S)
         a = self.angulo
+        # angulo de pie de la persona y umbrales relativos a el
+        tau = SENT_PIE_TAU_SUBE_S if (self.ref_pie is None or a > self.ref_pie) else SENT_PIE_TAU_BAJA_S
+        self.ref_pie = _ema(self.ref_pie, a, dt, tau)
+        self.arriba = min(SENT_ARRIBA, max(SENT_ARRIBA_MIN, self.ref_pie - SENT_PIE_MARGEN))
+        self.inicio = min(SENT_INICIO, self.arriba - SENT_INICIO_MARGEN)
 
         if self.estado == self.SIN_ARMAR:
-            self.t_cond = self.t_cond + dt if a > SENT_ARRIBA else 0.0
+            self.t_cond = self.t_cond + dt if a > self.arriba else 0.0
             if self.t_cond >= T_ARMADO_S:
                 self._cambiar(self.DE_PIE)
             return False
 
         if self.estado == self.DE_PIE:
-            self.t_cond = self.t_cond + dt if a < SENT_INICIO else 0.0
+            self.t_cond = self.t_cond + dt if a < self.inicio else 0.0
             if self.t_cond >= T_MIN_INICIO_S:
                 self._cambiar(self.BAJANDO)
                 self.minimo, self.t_abajo, self.pausa, self.t_bajo = a, 0.0, 0.0, 0.0
@@ -488,7 +542,7 @@ class FSMSentadilla:
             if listo:
                 self.t_abajo = self.pausa
                 self._cambiar(self.ABAJO)
-            elif a > SENT_ARRIBA:
+            elif a > self.arriba:
                 # se ha vuelto a estirar sin pausa abajo: no cuenta
                 motivo = ("sin pausa abajo" if MODO_T_MIN == "pausa" else "muy breve abajo") \
                     if self.minimo < SENT_ABAJO else "poco profunda"
@@ -512,7 +566,7 @@ class FSMSentadilla:
         if a < SENT_ABAJO:
             self._cambiar(self.ABAJO)   # rebote: vuelve a la flexion, sigue siendo la misma
             return False
-        self.t_cond = self.t_cond + dt if a > SENT_ARRIBA else 0.0
+        self.t_cond = self.t_cond + dt if a > self.arriba else 0.0
         if self.t_cond >= T_MIN_ARRIBA_S:
             self.ultimo_minimo = self.minimo
             self.minimo = None
@@ -572,6 +626,22 @@ class RehabEngine:
             self.sent = None
             self.est_rodilla = EstimadorRodilla()
             self.fsm_sent = FSMSentadilla()
+            self.sent_estado_prev = FSMSentadilla.SIN_ARMAR
+            self.zancada = None          # separacion delante-detras de los pies / pierna (depuracion)
+            self.zancada_t = 0.0
+            self.zancada_max = 0.0
+            self.zancada_mal = False
+            self.tronco = None           # inclinacion del tronco (solo de perfil), depuracion
+            self.de_perfil = False
+            self.tronco_t = 0.0
+            self.tronco_max = 0.0
+            self.tronco_mal = False
+            self.tronco_ref = None       # altura del tronco / anchura de hombros, de pie (de frente)
+            self.tronco_modo = None      # "perfil" o "frente" (depuracion)
+            self.pie_alto = None         # diferencia de altura de los tobillos / pierna (depuracion)
+            self.pie_alto_t = 0.0
+            self.pie_alto_max = 0.0
+            self.pie_alto_mal = False
             self.repeticiones_sentadilla = 0
             # fase 3
             self.inclinado_desde = None
@@ -878,17 +948,172 @@ class RehabEngine:
         self._anotar(t, f"abduccion {self.repeticiones_abduccion} ({lado[0].upper()}, {pico:.0f}°)")
         self.fsm_abd[lado].pico = 0.0
 
+    @staticmethod
+    def _separacion_pies(P, vis, W):
+        """Separacion delante-detras de los tobillos dividida por la longitud media de la pierna.
+
+        En 3D usa el eje antero-posterior del cuerpo (normal a la linea de caderas, horizontal),
+        asi que vale de frente, de perfil y girado. Sin 3D solo puede mirar la diferencia de
+        altura de los tobillos en la imagen (de frente, el pie adelantado se ve mas abajo).
+        """
+        ids = (CADERA_I, CADERA_D, RODILLA_I, RODILLA_D, TOBILLO_I, TOBILLO_D)
+        if any(vis[i] < VIS_CADERA_MIN for i in ids):
+            return None
+        Q = W if W is not None else P
+        pierna = (np.linalg.norm(Q[CADERA_I] - Q[RODILLA_I]) + np.linalg.norm(Q[RODILLA_I] - Q[TOBILLO_I]) +
+                  np.linalg.norm(Q[CADERA_D] - Q[RODILLA_D]) + np.linalg.norm(Q[RODILLA_D] - Q[TOBILLO_D])) / 2
+        if pierna < 1e-6:
+            return None
+        if W is None:
+            return abs(float(P[TOBILLO_I][1] - P[TOBILLO_D][1])) / pierna
+        arriba = np.array([0.0, -1.0, 0.0])
+        lat = W[CADERA_I] - W[CADERA_D]
+        lat = lat - np.dot(lat, arriba) * arriba
+        n = np.linalg.norm(lat)
+        if n < 1e-6:
+            return None
+        delante = np.cross(lat / n, arriba)
+        return abs(float(np.dot(W[TOBILLO_I] - W[TOBILLO_D], delante))) / pierna
+
+    @staticmethod
+    def _tronco_perfil(P, vis, W):
+        """(de_perfil, inclinacion del tronco en grados respecto a la vertical) o (False, None).
+
+        De perfil se mide en la imagen (plano XY con aspecto corregido), donde se ve tal cual.
+        Para saber si esta de perfil: en 3D, giro de la linea de caderas+hombros respecto al eje x
+        de la camara; sin 3D, lo estrechos que se ven caderas y hombros frente a la altura del tronco.
+        """
+        ids = (HOMBRO_I, HOMBRO_D, CADERA_I, CADERA_D)
+        if any(vis[i] < VIS_CADERA_MIN for i in ids):
+            return False, None
+        h = (P[HOMBRO_I] + P[HOMBRO_D]) / 2
+        c = (P[CADERA_I] + P[CADERA_D]) / 2
+        tronco = h - c
+        alto = float(np.linalg.norm(tronco))
+        if alto < 1e-6:
+            return False, None
+        if W is not None:
+            lat = (W[CADERA_I] - W[CADERA_D]) + (W[HOMBRO_I] - W[HOMBRO_D])
+            giro = math.degrees(math.atan2(abs(float(lat[2])), abs(float(lat[0])) + 1e-9))
+            perfil = giro >= SENT_PERFIL_GIRO_MIN
+        else:
+            ancho = (np.linalg.norm(P[CADERA_I] - P[CADERA_D]) + np.linalg.norm(P[HOMBRO_I] - P[HOMBRO_D])) / 2
+            perfil = ancho / alto <= SENT_PERFIL_ANCHO_MAX
+        if not perfil:
+            return False, None
+        return True, angulo_vectores(np.array([0.0, -1.0]), tronco)
+
+    def _tronco_frente(self, P, vis, W, dt, de_pie):
+        """Inclinacion del tronco de frente (grados) por escorzo, confirmada en 3D; o None.
+
+        Mientras la persona esta de pie aprende la relacion altura del tronco / anchura de hombros.
+        Devuelve el angulo por escorzo solo si la inclinacion 3D tambien supera SENT_TRONCO_3D_CONFIRMA
+        (si no hay 3D, devuelve el de escorzo tal cual).
+        """
+        ids = (HOMBRO_I, HOMBRO_D, CADERA_I, CADERA_D)
+        if any(vis[i] < VIS_CADERA_MIN for i in ids):
+            return None
+        ancho = float(np.linalg.norm(P[HOMBRO_I] - P[HOMBRO_D]))
+        # solo la componente vertical: con el cuerpo algo girado parte de la inclinacion se ve de lado
+        alto = abs(float(((P[HOMBRO_I] + P[HOMBRO_D]) / 2 - (P[CADERA_I] + P[CADERA_D]) / 2)[1]))
+        if ancho < 1e-6:
+            return None
+        rel = alto / ancho
+        if de_pie:
+            self.tronco_ref = _ema(self.tronco_ref, rel, dt, SENT_TRONCO_REF_TAU_S)
+            return None
+        if self.tronco_ref is None:
+            return None
+        ang = math.degrees(math.acos(max(0.0, min(1.0, rel / self.tronco_ref))))
+        if W is not None:
+            t3 = (W[HOMBRO_I] + W[HOMBRO_D]) / 2 - (W[CADERA_I] + W[CADERA_D]) / 2
+            ang3 = angulo_vectores(np.array([0.0, -1.0, 0.0]), t3)
+            if ang3 is None or ang3 < SENT_TRONCO_3D_CONFIRMA:
+                return min(ang, SENT_TRONCO_3D_CONFIRMA)   # no confirmado: no puede invalidar
+        return ang
+
+    @staticmethod
+    def _pie_levantado(P, vis, W):
+        """Diferencia de altura entre los dos tobillos dividida por la longitud media de la pierna.
+
+        Usa la y de pose_world_landmarks (metros) si hay 3D, si no la de la imagen. Con un tobillo poco
+        visible tambien mide: es justo lo que pasa de perfil con la pierna del fondo.
+        """
+        ids = (CADERA_I, CADERA_D, RODILLA_I, RODILLA_D, TOBILLO_I, TOBILLO_D)
+        if any(vis[i] < VIS_CADERA_MIN for i in ids):
+            return None
+        Q = W if W is not None else P
+        pierna = (np.linalg.norm(Q[CADERA_I] - Q[RODILLA_I]) + np.linalg.norm(Q[RODILLA_I] - Q[TOBILLO_I]) +
+                  np.linalg.norm(Q[CADERA_D] - Q[RODILLA_D]) + np.linalg.norm(Q[RODILLA_D] - Q[TOBILLO_D])) / 2
+        if pierna < 1e-6:
+            return None
+        return abs(float(Q[TOBILLO_I][1] - Q[TOBILLO_D][1])) / pierna
+
     def _fase_2(self, P, vis, dt, t, W=None):
-        """Sentadilla: angulo de rodilla (2D + escorzo) y FSM con pausa minima abajo."""
+        """Sentadilla: angulo de rodilla (3D, o 2D + escorzo), FSM con t_min abajo y zancadas."""
         ang = self.est_rodilla.medir(P, vis, dt, W)
+        fsm = self.fsm_sent
         if ang is None:
-            self.fsm_sent.sin_medida(dt)
-        elif self.fsm_sent.actualizar(ang, dt):
-            self.repeticiones_sentadilla += 1
-            self._anotar(t, f"sentadilla {self.repeticiones_sentadilla} ({self.fsm_sent.ultimo_minimo:.0f}°)")
-        if self.fsm_sent.evento:
-            self._anotar(t, self.fsm_sent.evento)
-        self.sent = self.fsm_sent.angulo
+            fsm.sin_medida(dt)
+            completada = False
+        else:
+            completada = fsm.actualizar(ang, dt)
+
+        # empieza una repeticion nueva: se olvida la anterior
+        if fsm.estado == FSMSentadilla.BAJANDO and self.sent_estado_prev not in (
+                FSMSentadilla.BAJANDO, FSMSentadilla.SUBIENDO):
+            self.zancada_t, self.zancada_max, self.zancada_mal = 0.0, 0.0, False
+            self.tronco_t, self.tronco_max, self.tronco_mal = 0.0, 0.0, False
+            self.pie_alto_t, self.pie_alto_max, self.pie_alto_mal = 0.0, 0.0, False
+
+        en_rep = fsm.estado in (FSMSentadilla.BAJANDO, FSMSentadilla.ABAJO, FSMSentadilla.SUBIENDO)
+        if not en_rep and not completada and ang is not None and ang > fsm.arriba:
+            self._tronco_frente(P, vis, W, dt, de_pie=True)   # de pie: aprende la referencia
+        if en_rep or completada:
+            self.zancada = self._separacion_pies(P, vis, W)
+            if self.zancada is not None:
+                self.zancada_max = max(self.zancada_max, self.zancada)
+                self.zancada_t = self.zancada_t + dt if self.zancada > SENT_ZANCADA_MAX else 0.0
+                if self.zancada_t >= SENT_ZANCADA_T_S:
+                    self.zancada_mal = True
+            self.pie_alto = self._pie_levantado(P, vis, W)
+            if self.pie_alto is not None:
+                self.pie_alto_max = max(self.pie_alto_max, self.pie_alto)
+                self.pie_alto_t = self.pie_alto_t + dt if self.pie_alto > SENT_PIE_LEVANTADO_MAX else 0.0
+                if self.pie_alto_t >= SENT_PIE_LEVANTADO_T_S:
+                    self.pie_alto_mal = True
+            self.de_perfil, self.tronco = self._tronco_perfil(P, vis, W)
+            limite = SENT_TRONCO_MAX
+            self.tronco_modo = "perfil" if self.tronco is not None else None
+            if self.tronco is None and SENT_TRONCO_FRENTE and not self.de_perfil:
+                self.tronco = self._tronco_frente(P, vis, W, dt, de_pie=False)
+                limite = SENT_TRONCO_FRENTE_MAX
+                self.tronco_modo = "frente" if self.tronco is not None else None
+            if self.tronco is not None:
+                self.tronco_max = max(self.tronco_max, self.tronco)
+                self.tronco_t = self.tronco_t + dt if self.tronco > limite else 0.0
+                if self.tronco_t >= SENT_TRONCO_T_S:
+                    self.tronco_mal = True
+            else:
+                self.tronco_t = 0.0
+
+        if completada:
+            if self.pie_alto_mal:
+                self._anotar(t, f"no es sentadilla: una pierna levantada ({self.pie_alto_max:.2f})")
+            elif self.zancada_mal:
+                self._anotar(t, f"sentadilla no valida: zancada, un pie delante del otro ({self.zancada_max:.2f})")
+            elif self.tronco_mal:
+                self._anotar(t, f"sentadilla no valida: tronco demasiado inclinado ({self.tronco_max:.0f}°)")
+            else:
+                self.repeticiones_sentadilla += 1
+                self._anotar(t, f"sentadilla {self.repeticiones_sentadilla} ({fsm.ultimo_minimo:.0f}°)")
+            self.zancada_t, self.zancada_max, self.zancada_mal = 0.0, 0.0, False
+            self.tronco_t, self.tronco_max, self.tronco_mal = 0.0, 0.0, False
+            self.pie_alto_t, self.pie_alto_max, self.pie_alto_mal = 0.0, 0.0, False
+        if fsm.evento:
+            self._anotar(t, fsm.evento)
+        self.sent_estado_prev = fsm.estado
+        self.sent = fsm.angulo
 
     def _fase_3(self, img, vis, t):
         # compensacion: tronco inclinado lateralmente de forma sostenida
@@ -951,7 +1176,20 @@ class RehabEngine:
             rodilla = "rodilla ?" if f2.angulo is None else \
                 f"rodilla{' 3D' if self.est_rodilla.usa_3d else ''} {f2.angulo:.0f}deg"
             lineas.append((f"sentadilla: {f2.estado}  {rodilla}  {'abajo' if MODO_T_MIN == 'acumulado' else 'pausa'} {f2.pausa:.1f}s  "
-                           f"reps {self.repeticiones_sentadilla}", f2.angulo is not None))
+                           f"pie>{f2.arriba:.0f}  reps {self.repeticiones_sentadilla}", f2.angulo is not None))
+            if self.zancada is not None:
+                lineas.append((f"pies delante-detras: {self.zancada:.2f}"
+                               + ("  ZANCADA" if self.zancada > SENT_ZANCADA_MAX else ""),
+                               self.zancada <= SENT_ZANCADA_MAX))
+            if self.pie_alto is not None:
+                lineas.append((f"pies altura: {self.pie_alto:.2f}"
+                               + ("  PIERNA LEVANTADA" if self.pie_alto > SENT_PIE_LEVANTADO_MAX else ""),
+                               self.pie_alto <= SENT_PIE_LEVANTADO_MAX))
+            if self.tronco is not None:
+                lim = SENT_TRONCO_MAX if self.tronco_modo == "perfil" else SENT_TRONCO_FRENTE_MAX
+                lineas.append((f"tronco ({self.tronco_modo}): {self.tronco:.0f}deg"
+                               + ("  DEMASIADO INCLINADO" if self.tronco > lim else ""),
+                               self.tronco <= lim))
             return lineas
 
     def instantanea(self):
@@ -1007,7 +1245,7 @@ def _depurar_video(ruta):
     w.writerow(["t", "visibles", "torso_giro", "caderas",
                 "I_ang", "I_muneca", "I_codo", "I_escorzo", "I_plano", "I_en_plano", "I_estado",
                 "D_ang", "D_muneca", "D_codo", "D_escorzo", "D_plano", "D_en_plano", "D_estado",
-                "abducciones", "sentadillas", "rodilla", "sent_estado", "sent_pausa", "errores_tronco"])
+                "abducciones", "sentadillas", "rodilla", "sent_estado", "sent_pausa", "zancada", "tronco_perfil", "pie_levantado", "errores_tronco"])
 
     motor = RehabEngine()
     puntos, conexiones = obtener_estilos_dibujo()
@@ -1045,7 +1283,8 @@ def _depurar_video(ruta):
             fila += [r(i["ang"]), r(i["ang_muneca"]), r(i["codo"]), r(i["escorzo"]), r(i["plano"]), int(i["en_plano"]),
                      motor.fsm_abd[lado].estado]
         fila += [motor.repeticiones_abduccion, motor.repeticiones_sentadilla, r(motor.sent),
-                 motor.fsm_sent.estado, round(motor.fsm_sent.pausa, 2), len(motor.timestamps_errores)]
+                 motor.fsm_sent.estado, round(motor.fsm_sent.pausa, 2), r(motor.zancada), r(motor.tronco), r(motor.pie_alto),
+                 len(motor.timestamps_errores)]
         w.writerow(fila)
 
     cap.release()
