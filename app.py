@@ -8,7 +8,6 @@ import hashlib
 import threading
 import streamlit as st
 import streamlit.components.v1 as components
-import cv2
 import mediapipe as mp
 import av
 from streamlit_webrtc import webrtc_streamer, WebRtcMode
@@ -121,20 +120,6 @@ def _timestamp_ms(frame):
         return tiempo_ctx["acumulado_ms"]
 
 
-# texto sobre el video con lo que mide el motor (poner a False para la demo final)
-MOSTRAR_DEPURACION = True
-
-
-def dibujar_depuracion(img, lineas):
-    escala = max(0.5, img.shape[0] / 720)
-    y = int(30 * escala)
-    for texto, ok in lineas:
-        color = (140, 255, 150) if ok else (40, 60, 255)  # verde si es valido, rojo si no (BGR)
-        cv2.putText(img, texto, (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6 * escala, (0, 0, 0), int(4 * escala), cv2.LINE_AA)
-        cv2.putText(img, texto, (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6 * escala, color, max(1, int(1.5 * escala)), cv2.LINE_AA)
-        y += int(26 * escala)
-
-
 def procesar_frame(frame):
     img = frame.to_ndarray(format="bgr24")
     t_ms = _timestamp_ms(frame)
@@ -147,8 +132,6 @@ def procesar_frame(frame):
             spec_puntos,
             spec_conexiones,
         )
-    if MOSTRAR_DEPURACION:
-        dibujar_depuracion(img, motor.texto_depuracion())
     return av.VideoFrame.from_ndarray(img, format="bgr24")
 
 
