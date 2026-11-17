@@ -1,4 +1,4 @@
-# Rehab Monitor · Grupo Rosa
+# Ghost Rehab · Grupo Rosa
 **EuriChallenge 2026 · Reto de Ingeniería Biomédica: "Gamificando la Fisioterapia con IA"**
 EESTEC LC Madrid & Eurielec · ETSIT, Universidad Politécnica de Madrid
 
