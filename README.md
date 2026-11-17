@@ -1,10 +1,13 @@
 # Ghost Rehab · Grupo Rosa
 **EuriChallenge 2026 · Reto de Ingeniería Biomédica: "Gamificando la Fisioterapia con IA"**
 EESTEC LC Madrid & Eurielec · ETSIT, Universidad Politécnica de Madrid
+Equipo: Alba Santos, Antía Sande, Lucía Martínez Miramontes
 
 Monitor de rehabilitación física que funciona con una sola cámara web. Cuenta repeticiones de **abducción de hombro** y **sentadilla**, detecta **compensaciones clínicas** (inclinación del tronco y asimetría escapular) y guía al paciente con un **juego** que se controla desde un **Elgato Stream Deck**.
 
 La idea de diseño ha sido **pensar como un fisioterapeuta**: solo cuentan las repeticiones bien hechas, y cada aviso es explicable (el sistema dice qué ha pasado y en qué segundo). Al mismo tiempo, es **permisivo con el paciente**: los umbrales son realistas y se adaptan a la postura de cada persona.
+
+**Proyecto ganador del EURIChallenge 2026** 
 
 ---
 
